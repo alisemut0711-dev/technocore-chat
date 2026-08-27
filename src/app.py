@@ -119,8 +119,8 @@ SKILL_DIGEST = "sha256:" + hashlib.sha256(SKILL.encode("utf-8")).hexdigest()
 # is why SKILL is read separately above — SKILL_DIGEST must hash the string actually served.
 _DOCS = {
     "/skill.md": SKILL,
-    "/patterns.md": _asset("patterns.md"),
-    "/interop.md": _asset("interop.md"),
+    "/patterns.md": _asset("patterns.md"), "/interop.md": _asset("interop.md"),
+    "/manual.id.md": _asset("manual.id.md"),
 }
 
 BANNER = (

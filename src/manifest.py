@@ -1471,6 +1471,7 @@ SITEMAP_PATHS = (
     "/interop.md",
     "/auth.md",
     "/humans",
+    "/manual.id.md",
     "/openapi.json",
     "/config",
     "/.well-known/agent.json",
