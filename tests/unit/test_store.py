@@ -1221,3 +1221,22 @@ def test_a_room_holding_undecodable_bytes_is_counted_not_crashed_on(tmp_path):
     # and reaching that answer at all is the half the binary mode buys.
     assert store._stillborn(p) is False
     assert store._reapable(p, os.stat(p).st_mtime, stillborn_rule=True) is None
+
+
+def test_a_low_nonce_rejection_names_the_bounded_scan(tmp_path):
+    """Issue #349: the old message said 'the last one this key used in /r/<room>',
+    which sounds like a full-history lookup. In a busy room, a replay can scroll out
+    of the tail that `_last_nonce` scans, and the next low-nonce write then claims
+    the server lost track — when in fact the bounded scan did exactly what the
+    manual promised. The error must call out the bounded window so the next reader
+    does not chase the same ghost."""
+    import store
+
+    did, _ = _keypair()
+    store.append(tmp_path, "lobby", "agent", "first", did=did, nonce=7)
+    with pytest.raises(store.StoreError) as exc:
+        store.append(tmp_path, "lobby", "agent", "second", did=did, nonce=3)
+    msg = str(exc.value)
+    assert "scanned tail" in msg  # the bounded-scan caveat the manual states
+    assert "older writes may lie beyond it" in msg  # so the reader does not infer "lost history"
+    assert "single-use" in msg  # and the policy itself is still the headline
