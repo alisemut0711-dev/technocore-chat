@@ -1258,6 +1258,109 @@ def test_a_room_holding_undecodable_bytes_is_counted_not_crashed_on(tmp_path):
     assert store._reapable(p, os.stat(p).st_mtime, stillborn_rule=True) is None
 
 
+<<<<<<< HEAD
+def test_compaction_retains_the_whole_byte_budget_at_every_record_size(tmp_path):
+    """Retention is the byte budget, at every record size.
+
+    `COMPACT_MAX_LINES` sits beside the budget in `_compact`, and the comment on it says it
+    "only bounds how much the compactor holds in memory at once". A flat 5000 made that
+    false: it bound first for any record under ~1 KB, which is every ordinary message. A
+    full ring of ~81-byte records compacted to 5000 records / 400 KB — 7.6% of the floor
+    the ring model promises, with every `since=` cursor further back than 5000 losing
+    history the ring still owed it.
+
+    Deriving the cap from the budget restores the stated meaning: at the smallest record
+    the write path emits (~73 B) the byte budget always stops the scan first, so the count
+    can only ever bind on malformed input, which is the memory case it is for.
+
+    Asserted at the small end because that is the end that broke, and against `keep` rather
+    than a record count so it keeps holding if the record shape changes.
+    """
+    import json
+
+    import store
+
+    path = tmp_path / "small.jsonl"
+    record = {"seq": 0, "ts": "2026-08-27T00:00:00.000000Z", "from": "bot", "text": "hi"}
+    written = size = 0
+    with path.open("wb") as handle:  # built directly: 140k append() calls is not a unit test
+        while size <= store.MAX_ROOM_BYTES:
+            written += 1
+            record["seq"] = written
+            line = (json.dumps(record) + "\n").encode()
+            handle.write(line)
+            size += len(line)
+
+    store._compact(path, cutoff=None, keep=store.COMPACT_KEEP_BYTES)
+
+    data = path.read_bytes()
+    seqs = [json.loads(line)["seq"] for line in data.splitlines()]
+    # Within one record of the budget, not merely "more than the old cap".
+    assert len(data) > store.COMPACT_KEEP_BYTES - 200, (
+        f"retained {len(data)} of a {store.COMPACT_KEEP_BYTES} byte budget"
+    )
+    assert len(data) <= store.COMPACT_KEEP_BYTES
+    assert seqs == sorted(seqs), "compaction must leave the file ascending by seq"
+    assert seqs[-1] == written, "the newest record must survive compaction"
+
+
+def test_the_append_path_can_size_the_file_it_just_wrote(tmp_path):
+    """The compaction check adds `size + len(line)` rather than stat()ing a file it has just
+    written while holding the room lock. That is exact only because `size` is read *before*
+    the torn-tail heal may prepend a newline to `line`, and `line` is what actually reaches
+    the disk — so a torn tail is the case an off-by-one would show up in, and it is the case
+    a crash mid-write actually produces.
+
+    Asserted through the public append path and the bytes on disk rather than by reaching
+    for the number: what matters is that the healed file is well-formed and its size is the
+    sum the caller could have computed.
+    """
+    import store
+
+    store.append(tmp_path, "torncalc", "bot", "first")
+    path = store.room_path(tmp_path, "torncalc")
+    with path.open("r+b") as f:  # a write cut short by a crash: the trailing newline is gone
+        f.truncate(path.stat().st_size - 1)
+
+    before = path.stat().st_size
+    store.append(tmp_path, "torncalc", "bot", "second")
+    after = path.stat().st_size
+
+    body = path.read_bytes()
+    assert body.endswith(b"\n")
+    assert b"\n\n" not in body, "the heal adds exactly one newline, not one per append"
+    # Two records, two line terminators: the append wrote its own newline and the heal
+    # restored the one the tear removed — no more, which is what makes size + len(line) the
+    # file's real size rather than an estimate that happens to be close.
+    assert body.count(b"\n") == 2
+    assert after == before + (len(body) - before)
+    assert after > before
+
+    texts = [m["text"] for m in store.read_messages(tmp_path, "torncalc")["messages"]]
+    assert texts == ["first", "second"], "the healed record and the new one both survive"
+
+
+def test_service_stats_counts_rooms_from_the_maintained_totals(tmp_path, monkeypatch):
+    """The room count is the integer the cap is enforced against, not a fresh walk.
+
+    Statting every room file was 71% of this pass at the live size (238,983 rooms: 3.26 s
+    with it, 0.94 s without), for two numbers one file already holds.
+    """
+    import store
+
+    for room in ("openroom", "p-secret", "d-owned"):
+        store.append(tmp_path, room, "nick", "hi")
+    walked = store._count_rooms(tmp_path)  # the three above plus the service's own events room
+
+    store._write_note_count(tmp_path, 41, 4100, name=store.USAGE_FILE)
+    view = store.service_stats(tmp_path)
+    assert walked[0] != 41, "the fixture must be able to tell the two apart"
+    assert view["rooms"]["total"] == 41, "the maintained count, not the walk's"
+    assert view["bytes"]["rooms"] == 4100
+    # The class decomposition still comes from the names on disk, which only a walk has.
+    assert (view["rooms"]["unlisted"], view["rooms"]["ownable"]) == (1, 1)
+
+
 def test_compaction_retains_the_whole_byte_budget_at_every_record_size(tmp_path):
     """Retention is the byte budget, at every record size.
 
@@ -1372,3 +1475,41 @@ def test_service_stats_measures_room_bytes_until_a_reap_settles_them(tmp_path):
     store.append(tmp_path, "openroom", "nick", "hi")
     assert store.room_bytes_used(tmp_path) == 0  # nothing reaped yet
     assert store.service_stats(tmp_path)["bytes"]["rooms"] == store._count_rooms(tmp_path)[1] > 0
+
+
+def test_a_low_nonce_rejection_names_the_bounded_scan(tmp_path):
+    """Issue #349: the old message said 'the last one this key used in /r/<room>',
+    which sounds like a full-history lookup. In a busy room, a replay can scroll out
+    of the tail that `_last_nonce` scans, and the next low-nonce write then claims
+    the server lost track — when in fact the bounded scan did exactly what the
+    manual promised. The error must call out the bounded window so the next reader
+    does not chase the same ghost."""
+    import store
+
+    did, _ = _keypair()
+    store.append(tmp_path, "lobby", "agent", "first", did=did, nonce=7)
+    with pytest.raises(store.StoreError) as exc:
+        store.append(tmp_path, "lobby", "agent", "second", did=did, nonce=3)
+    msg = str(exc.value)
+    assert "scanned tail" in msg  # the bounded-scan caveat the manual states
+    assert "older writes may lie beyond it" in msg  # so the reader does not infer "lost history"
+    assert "single-use" in msg  # and the policy itself is still the headline
+=======
+def test_a_low_nonce_rejection_names_the_bounded_scan(tmp_path):
+    """Issue #349: the old message said 'the last one this key used in /r/<room>',
+    which sounds like a full-history lookup. In a busy room, a replay can scroll out
+    of the tail that `_last_nonce` scans, and the next low-nonce write then claims
+    the server lost track — when in fact the bounded scan did exactly what the
+    manual promised. The error must call out the bounded window so the next reader
+    does not chase the same ghost."""
+    import store
+
+    did, _ = _keypair()
+    store.append(tmp_path, "lobby", "agent", "first", did=did, nonce=7)
+    with pytest.raises(store.StoreError) as exc:
+        store.append(tmp_path, "lobby", "agent", "second", did=did, nonce=3)
+    msg = str(exc.value)
+    assert "scanned tail" in msg  # the bounded-scan caveat the manual states
+    assert "older writes may lie beyond it" in msg  # so the reader does not infer "lost history"
+    assert "single-use" in msg  # and the policy itself is still the headline
+>>>>>>> 9f21e88 (docs: nonce rejection names the bounded scan window (#349))
