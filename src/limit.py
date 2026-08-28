@@ -280,8 +280,11 @@ def take(request, kind, per_min, burst=None, *, ip_header="", max_buckets=MAX_BU
         wait = 0.0
     else:
         wait = (1.0 - tokens) * 60.0 / per_min
+    # pop-then-insert, not move_to_end: assigning an existing key leaves the entry
+    # where it already was, which may be the front, and a concurrent evictor's popitem
+    # takes it from there — turning the move_to_end that used to follow into a KeyError.
+    _buckets.pop((ip, kind), None)
     _buckets[(ip, kind)] = (tokens, now)
-    _buckets.move_to_end((ip, kind))
     while len(_buckets) > max_buckets:
         _buckets.popitem(last=False)
     # Counted at the one point every rate-limited route already funnels through, so a new
