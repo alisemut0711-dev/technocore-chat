@@ -60,6 +60,10 @@ VALUE="hello from the KV lane"
 # Helper
 fail() { echo "FAIL: $1"; exit 1; }
 body() { curl -sS "$BASE$1"; }
+# A KV read is prefixed with the "!! UNTRUSTED CONTENT" banner and a blank line;
+# the stored value is the content after it. Take the last non-empty line to compare
+# against what we wrote.
+value_of() { grep -v "HTTP_STATUS" <<<"$1" | grep -v '^$' | tail -n1; }
 
 # 1. Read a key that does not exist — expect 404
 echo "== read non-existent key"
@@ -82,7 +86,7 @@ echo ""
 echo "== read key back"
 RESP=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "$BASE/kv/$NS/$KEY")
 STATUS=$(echo "$RESP" | grep "HTTP_STATUS" | cut -d: -f2)
-BODY=$(echo "$RESP" | grep -v "HTTP_STATUS")
+BODY=$(value_of "$RESP")
 echo "   HTTP $STATUS — $BODY"
 [ "$STATUS" = "200" ] || fail "read failed with $STATUS"
 [ "$BODY" = "$VALUE" ] || fail "expected '$VALUE', got '$BODY'"
@@ -109,7 +113,7 @@ echo "   HTTP $STATUS — ok"
 # 6. Confirm new value
 RESP=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "$BASE/kv/$NS/$KEY")
 STATUS=$(echo "$RESP" | grep "HTTP_STATUS" | cut -d: -f2)
-BODY=$(echo "$RESP" | grep -v "HTTP_STATUS")
+BODY=$(value_of "$RESP")
 [ "$BODY" = "$NEW_VALUE" ] || fail "overwrite did not persist: got '$BODY'"
 echo "   new value confirmed"
 echo ""
