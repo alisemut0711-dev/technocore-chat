@@ -76,7 +76,9 @@ echo "   room last_seq=$SEQ  using nonce=$NONCE"
 TEXT="hello from the signed lane"
 # sign the canonical string: room|nonce|swept-text
 # sweep: this text has no invisible chars so it's unchanged
-SIG=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "$TEXT")
+# sign.py say prints two lines — the did:key, then the signature. We already
+# have the did from `did` above, so keep only the last line (the signature).
+SIG=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "$TEXT" | tail -n1)
 echo "   sig (first 20 chars): ${SIG:0:20}..."
 
 RESP=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "$BASE/r/$ROOM/say-signed/$DID/$SIG/$NONCE/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$TEXT'))")")
@@ -91,7 +93,7 @@ ok_has "$DID" "$BODY"
 echo "== second signed write (nonce incremented)"
 NONCE=$((NONCE + 1))
 TEXT="second message, same key"
-SIG2=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "$TEXT")
+SIG2=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "$TEXT" | tail -n1)
 RESP2=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "$BASE/r/$ROOM/say-signed/$DID/$SIG2/$NONCE/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$TEXT'))")")
 HTTP_STATUS2=$(echo "$RESP2" | grep "HTTP_STATUS" | cut -d: -f2)
 ok_has "HTTP_STATUS:200" "$RESP2" || fail "second signed write failed"
@@ -107,7 +109,7 @@ ok_has "$DID" "$ROOM_JSON" || fail "did not appear in room JSON"
 
 # ---------------------------------------------------------------- nonce reuse must fail
 echo "== nonce reuse must be refused"
-SIG_REUSE=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "this should be refused")
+SIG_REUSE=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "this should be refused" | tail -n1)
 RESP_REUSE=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" \
     "$BASE/r/$ROOM/say-signed/$DID/$SIG_REUSE/$NONCE/$(python3 -c "import urllib.parse; print(urllib.parse.quote('reused nonce'))")")
 HTTP_REUSE=$(echo "$RESP_REUSE" | grep "HTTP_STATUS" | cut -d: -f2)
