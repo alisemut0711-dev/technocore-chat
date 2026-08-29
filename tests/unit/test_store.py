@@ -1157,3 +1157,34 @@ def test_a_json_escaped_did_is_the_one_record_the_nonce_scan_cannot_see(tmp_path
     assert rec is not None and rec["from"] == did  # legal JSON, and it parses to the DID
     assert did.encode() not in room.read_bytes()  # but not present as itself, so:
     assert store._last_nonce(tmp_path, "lobby", did) is None
+
+
+def test_cached_window_survives_eviction_between_read_and_reinsert(tmp_path, monkeypatch):
+    """A memo hit re-inserts the entry to keep it hot; the code that did so was a `get`
+    followed by `move_to_end`. A concurrent evictor's `popitem(last=False)` can take the
+    key in the gap between the two — `room_stats` runs in Starlette's threadpool — and
+    `move_to_end` on a missing key raises KeyError, turning an overview read into a 500.
+    Same shape and same fix as `_buckets` and `_rooms_cache`: pop on read, reinsert on hit.
+
+    Deterministic rather than timed: a memo whose `pop` evicts a *second* time in the gap
+    would break the old `get`+`move_to_end`; the new `pop`-then-reinsert takes the key out
+    itself and so has nothing left for a racing evictor to miss on.
+    """
+    from collections import OrderedDict
+
+    import store
+
+    class MoveToEndRaises(OrderedDict):
+        def move_to_end(self, key, last=True):  # noqa: FBT002 - mirrors OrderedDict
+            raise KeyError(key)  # the key an evictor took in the gap is no longer here
+
+    racy = MoveToEndRaises()
+    monkeypatch.setattr(store, "_window_memo", racy)
+
+    store.append(tmp_path, "aaa", "bot", "one")
+    store.room_stats(tmp_path)  # populates the memo for "aaa"
+
+    # A second overview hits the memo. The old get+move_to_end path would call the
+    # booby-trapped move_to_end and raise; the pop-then-reinsert path never does.
+    view = store.room_stats(tmp_path)
+    assert {r["room"] for r in view["rooms"]} >= {"aaa"}

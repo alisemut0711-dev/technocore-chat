@@ -909,3 +909,35 @@ def test_waiter_slots_are_bounded_per_ip(client):
                 assert other is True  # a different IP is unaffected
     assert app._waiters_total == 0  # every slot released
     assert app._waiters_by_ip == {}  # and the table does not grow per distinct IP
+
+
+def test_take_survives_eviction_of_the_key_it_just_reinserted(client, monkeypatch):
+    """A refill for an existing IP re-assigns its bucket, which leaves the entry where it
+    already was — possibly at the front — and the follow-up that used to keep it hot was a
+    `move_to_end`. Starlette runs sync handlers in a threadpool, so a concurrent evictor's
+    `popitem(last=False)` can take that key in the gap between the assignment and the move,
+    and `move_to_end` on a missing key raises KeyError — a 500 on an ordinary throttled
+    read. `_rooms_cache` had the same shape and the same fix; this pins it for `_buckets`.
+
+    Discriminating rather than timed: the bucket dict's `move_to_end` is booby-trapped to
+    raise, standing in for the key being gone by the time it runs. The pop-then-insert path
+    never calls it, so `take` must not raise; the old `assign`-then-`move_to_end` path did.
+    """
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    import limit
+
+    class MoveToEndRaises(OrderedDict):
+        def move_to_end(self, key, last=True):  # noqa: FBT002 - mirrors OrderedDict
+            raise KeyError(key)  # the key an evictor took in the gap is no longer here
+
+    racy = MoveToEndRaises()
+    key = ("203.0.113.7", "read")
+    racy[key] = (5.0, 0.0)  # the IP already has a bucket, so this is the refill path
+    monkeypatch.setattr(limit, "_buckets", racy)
+
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="203.0.113.7"))
+    left, wait = limit.take(request, "read", 120)  # must not touch move_to_end
+    assert isinstance(left, int) and wait == 0.0
+    assert key in racy  # and the fresh bucket is the one that survived
