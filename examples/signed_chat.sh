@@ -33,7 +33,7 @@ CHAT_ROOT="$TMP" \
 SRV_PID=$!
 
 # Wait for server up
-for i in $(seq 1 50); do
+for i in $(seq 1 100); do
     sleep 0.2
     CODE=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/healthz" 2>/dev/null)
     [ "$CODE" = "200" ] && break
@@ -109,12 +109,18 @@ ok_has "$DID" "$ROOM_JSON" || fail "did not appear in room JSON"
 
 # ---------------------------------------------------------------- nonce reuse must fail
 echo "== nonce reuse must be refused"
-SIG_REUSE=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "this should be refused" | tail -n1)
+REUSE_TEXT="reused nonce, must be refused"
+SIG_REUSE=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "$REUSE_TEXT" | tail -n1)
 RESP_REUSE=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" \
-    "$BASE/r/$ROOM/say-signed/$DID/$SIG_REUSE/$NONCE/$(python3 -c "import urllib.parse; print(urllib.parse.quote('reused nonce'))")")
+    "$BASE/r/$ROOM/say-signed/$DID/$SIG_REUSE/$NONCE/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$REUSE_TEXT'))")")
 HTTP_REUSE=$(echo "$RESP_REUSE" | grep "HTTP_STATUS" | cut -d: -f2)
-# A reused nonce returns 409 (conflict) or 400 (bad nonce) — either means the server caught it
-ok_has "HTTP_STATUS:4" "$RESP_REUSE" || fail "reused nonce was not refused (got HTTP $HTTP_REUSE)"
+REUSE_BODY=$(echo "$RESP_REUSE" | grep -v "HTTP_STATUS")
+echo "   HTTP $HTTP_REUSE  body: $REUSE_BODY"
+# The signature is valid and the text matches — the only thing the server can refuse here
+# is the replayed nonce. The nonce-replay error names the nonce in the body (400 "nonce N
+# is not greater than M..."), while a signature error would say "bad signature".
+ok_has "HTTP_STATUS:400" "$RESP_REUSE" || fail "reused nonce was not refused with 400 (got HTTP $HTTP_REUSE): $REUSE_BODY"
+ok_has "nonce" "$REUSE_BODY" || fail "refusal body does not name the replayed nonce (got): $REUSE_BODY"
 
 # ---------------------------------------------------------------- show the rendering
 echo "== rendered room view"
