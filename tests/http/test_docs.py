@@ -1285,6 +1285,22 @@ def test_every_sitemap_url_is_one_the_crawler_is_allowed_to_index(client):
     assert "/rooms" not in client.get("/sitemap.xml").text
 
 
+def test_sitemap_escapes_xml_special_characters_in_the_public_url(client):
+    """The sitemap is served as `application/xml`; a `&` in CHAT_PUBLIC_URL must come out
+    as `&amp;` or a validating crawler rejects the whole document. The base is the one
+    configured origin, so the escape belongs on every `<loc>` regardless of which path."""
+    import config
+
+    with config.override(PUBLIC_URL="https://example.com?a=1&b=2"):
+        body = client.get("/sitemap.xml").text
+    assert "&amp;" in body
+    assert "?a=1&b=2" not in body  # raw ampersand would break XML well-formedness
+    # every loc is well-formed XML that a strict parser accepts
+    import xml.etree.ElementTree as ET
+
+    ET.fromstring(body)
+
+
 def test_markdown_negotiation_reads_q_values_not_header_order(client):
     """Header order is not preference. A client that writes `text/markdown;q=0` has
     refused markdown, and one that ranks markdown above plain text has asked for it
