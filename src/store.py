@@ -1907,8 +1907,8 @@ def _note_totals(d: Path, rebuild=_count_notes, persist=False, name=NOTES_FILE) 
 
     Read without the lock, like `counters`: replacement is atomic, so a reader sees the old
     bytes or the new ones. Reading is safe unserialised; *persisting* what the read rebuilt
-    is not, so `persist` is off by default and only `_check_note_capacity` turns it on —
-    that one runs inside the create gate, which IS this file's lock, and every other write of
+    is not, so `persist` is off by default and only `_check_note_capacity`'s authoritative,
+    locked call turns it on (see `_create_gate`) — every other write of
     a count file is under the same lock. A rebuild persisted from outside it would be a
     snapshot of a walk, installed after a create had already reserved a higher figure against
     the file, and the count would come out below the notes on disk: a low count admits writes
