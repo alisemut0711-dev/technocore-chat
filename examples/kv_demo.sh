@@ -36,13 +36,22 @@ SRV_PID=$!
 
 BASE="http://127.0.0.1:$PORT"
 
-# Wait for server up
-for i in $(seq 1 50); do
+# Wait for /healthz — never rate limited, so it is the right door to knock on
+# repeatedly. `if CODE=$(...)` rather than a bare assignment: under `set -e` a
+# failing curl (exit 7 while the port is still closed) would take the script
+# with it on the first try, before the server had any chance to boot. A
+# bash-native counter, not seq(1), for the same reason beautiful_chat.sh uses
+# one: a minimal environment may lack it, and its absence would run the loop
+# body zero times and then blame a server that was healthy all along.
+CODE=""
+tries=0
+while [ "$tries" -lt 100 ]; do
+    if CODE=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/healthz" 2>/dev/null) && [ "$CODE" = "200" ]; then
+        break
+    fi
+    tries=$((tries + 1))
     sleep 0.2
-    CODE=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/healthz" 2>/dev/null)
-    [ "$CODE" = "200" ] && break
 done
-
 if [ "${CODE:-}" != "200" ]; then
     echo "server failed to start"
     cat "$LOG"
