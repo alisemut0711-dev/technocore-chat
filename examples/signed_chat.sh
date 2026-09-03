@@ -60,23 +60,14 @@ ROOM="signed-demo-$$"
 fail() { echo "FAIL: $1"; exit 1; }
 ok_has() { grep -q "$1" <<<"$2" || fail "expected '$1' in: $2"; }
 
-# The nonce this key must use next in this room. Monotonicity is per key per room, so the
-# state to read is the highest nonce *this DID* has used *here* — not the room's `last_seq`,
-# which counts every writer's messages and would collide with another key's nonces or skip
-# past your own. A fresh key in a fresh room has no state and starts at 1.
-next_nonce() {
-    curl -sS "$BASE/r/$ROOM?format=json" | python3 -c '
-import json, sys
-did = sys.argv[1]
-doc = json.load(sys.stdin)
-used = [
-    m["nonce"]
-    for m in doc.get("messages", [])
-    if m.get("from") == did and isinstance(m.get("nonce"), int)
-]
-print(max(used) + 1 if used else 1)
-' "$DID"
-}
+# The nonce this key must use next. Since the demo creates a unique fresh room with a
+# fresh key, we track a local counter starting at 1 and increment after each use — no
+# need to query the room.  Querying the room via `GET /r/$ROOM?format=json` would be
+# wrong anyway: the API returns only the newest 50 messages, while the server's nonce
+# rejection scans the newest 1 MiB (READ_BUDGET), so if this DID's last signed write is
+# followed by >50 messages from other writers but is still inside 1 MiB, the query would
+# see no nonce and return 1 while the server sees the prior nonce and rejects.
+NONCE=1
 
 # ---------------------------------------------------------------- key setup
 echo "== generating Ed25519 key"
@@ -91,7 +82,6 @@ echo "   did: $DID"
 
 # ---------------------------------------------------------------- first signed write
 echo "== first signed write"
-NONCE=$(next_nonce)
 echo "   nonce state for this key in $ROOM: using nonce=$NONCE"
 
 TEXT="hello from the signed lane"
@@ -120,8 +110,8 @@ assert posted["sig"], "the record kept no signature to re-verify"
 ' "$DID" <<<"$BODY" || fail "the posted record is not attributed to $DID: $BODY"
 
 # ---------------------------------------------------------------- second signed write — nonce must increase
-echo "== second signed write (nonce read back from the room, so it increases)"
-NONCE=$(next_nonce)
+echo "== second signed write (nonce increases locally)"
+NONCE=$((NONCE + 1))
 echo "   nonce state for this key in $ROOM: using nonce=$NONCE"
 TEXT="second message, same key"
 SIG2=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "$TEXT" | tail -n1)
