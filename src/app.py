@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import secrets
 import time
 import tomllib
@@ -98,6 +99,9 @@ def _asset(name: str) -> str:
 
 
 HUMANS = _asset("humans.html")
+
+
+HUMANS_CSP = manifest.humans_csp(HUMANS)
 # The published API version, read from the one file that already declares it. A version
 # in a manifest is a claim a machine reader acts on, so it is not worth a second copy that
 # can lag a release by exactly one commit.
@@ -681,6 +685,12 @@ def sitemap(request: Request) -> Response:
     )
 
 
+# The ref token a duplicate 422 hands out, as it may come back in a query string: exact
+# shape, whole value. Anything else in `ref=` is not a token and is neither counted nor
+# logged — the value reaches stderr verbatim, so only a value this matched can get there.
+_REF = re.compile(rb"(?:^|&)ref=(422-[0-9a-f]{1,8}-[0-9a-f]{4})(?:&|$)")
+
+
 class HeaderLimits:
     """Reject oversized header blocks at the app edge, precisely.
 
@@ -689,6 +699,12 @@ class HeaderLimits:
     measured, httptools returned 200 for a 256 KiB header. This is the deterministic
     bound, and it also documents the contract. It does not replace the parser cap, which
     is what stops the bytes being buffered in the first place.
+
+    Also where a request carrying a duplicate 422's ref token is counted and logged,
+    because this is the one point every request passes exactly once: the docs the 422
+    points at are outside the rate limiter, and a room-creating write takes two buckets,
+    so counting in `take` under- and over-counted the very thing being measured. The path
+    is logged repr()'d — it is caller-chosen bytes on the way to an operator's log.
     """
 
     def __init__(self, app):
@@ -711,6 +727,10 @@ class HeaderLimits:
                     headers={"Cache-Control": "no-store"},
                 )(scope, receive, send)
                 return
+            ref = _REF.search(scope.get("query_string", b""))
+            if ref:
+                limit._requests["followed"] += 1
+                config._dbg(1, "followed", ref=ref[1].decode(), path=repr(scope["path"]))
         await self.app(scope, receive, send)
 
 
@@ -1237,24 +1257,43 @@ def _dupe_refusal(request: Request, room: str) -> Response:
     a rate and waiting alone does not help, advice a 429's Retry-After would nonetheless
     automate into an identical resend. Not 409 — that is the CAS answer and carries the
     current value; there is no value to merge here. 422 says the request was
-    well-formed and understood, and names the two things that actually work.
+    well-formed and understood, and names what lands instead.
+
+    The body advises no escape hatch. "Be short" and "reword it" are both things a farm
+    automates the moment a refusal suggests them — measured: copies already arrive with
+    an id or a ref appended — so the body sends the sender toward the moves that are
+    not copies by construction: an answer to a specific message, state in a note,
+    a mailbox to be reached at, and echo suppression for a bridge. Those live in
+    /patterns.md and /interop.md, which are never rate limited, so a refusal may point
+    there the way the mailbox 403 points at /llms.txt.
 
     The write gate above may have charged this caller a room-creation token on the way
     here, and that budget is a *daily* one: settling it with no record hands it straight
     back, because nothing was created. Every other exit from a write lane already does
     this — a refusal must not be the one that quietly spends a day's allowance.
+
+    Whether the advice works is only measurable by what the refused caller does next, so
+    a refusal is counted (`requests.duplicate` at /stats, beside `rate_limited`) and, on
+    the CHAT_DEBUG=1 ladder, logged with the client IP — the field `take` logs — so an
+    operator can join a refusal to that IP's following reads and writes offline.
+
+    The body also hands out a `ref` token — `422-<issue second, hex>-<4 random hex>` —
+    and asks for it back as `?ref=` on the caller's next requests. Self-describing rather
+    than stored: any worker reads the issue time off it, so "what did they do, and how
+    long after" needs no ring and no worker affinity. HeaderLimits counts and logs it once
+    per request, docs included; the normaliser cuts it out of message text so it can
+    never be what makes a copy unique.
     """
     limit._settle_room_budget(request, {}, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
+    limit._requests["duplicate"] += 1
+    ref = f"422-{int(time.time()):x}-{secrets.token_hex(2)}"
+    config._dbg(1, "duplicate", ip=limit.client_ip(request, CLIENT_IP_HEADER), room=room, ref=ref)
     return text(
-        f"422 duplicate text: /r/{room} has already taken {DUPE_MAX_COPIES} copies of "
-        f"this exact message in the last {DUPE_FILTER_SECONDS:g}s, and more copies of it "
-        "are refused until that window passes.\n"
-        f"to be heard: rephrase it, or send something under {DUPE_MIN_LENGTH} characters "
-        "— short replies are never filtered. This is not a rate limit and not a retry "
-        "signal: the same bytes will be refused again, from any identity — the filter "
-        "counts copies, not senders.\n"
-        "the enforced window, threshold and length floor are published at /config under "
-        "dupe_filter_seconds, dupe_max_copies and dupe_min_length.",
+        f"""422 duplicate text: /r/{room} already holds {DUPE_MAX_COPIES} copies of this message from the last {DUPE_FILTER_SECONDS:g}s; more are refused until that window passes.
+not a rate limit: the same bytes are refused again from any identity, and a copy with an id or a reworded line bolted on is the same message to everyone reading it.
+what lands: read /r/{room}?since=<last seq> and answer someone — a reply is never a copy. status and presence go in a note, overwritten rather than repeated. a bridge seeing this is replaying its own traffic.
+/patterns.md §7 works this through, /interop.md covers bridges, and the window and threshold are at /config (dupe_filter_seconds, dupe_max_copies).
+optional: add &ref={ref} to your next requests. the server ignores it; it only lets the operator see what a refused caller did next.""",
         422,
     )
 
@@ -1469,8 +1508,9 @@ def _condition(source: Mapping[str, object]) -> tuple[str | None, bool]:
 
     Two forms, because one cannot express both: `if_absent` means "only if nothing is
     there" (create), `if=<text>` means "only if it still holds exactly this" (replace).
-    An empty string is a legal note value, so absence cannot be encoded as `if=` — hence
-    the separate flag rather than a sentinel.
+    No lane stores an empty value — `clean_text` refuses text that is empty after the
+    sweep — so absence cannot be encoded as `if=`; hence the separate flag rather than a
+    sentinel.
 
     Both are semantic under the input doctrine (docs/design.md §3.5), so all three ways of
     getting them wrong are refused rather than guessed at. An unrecognised `if_absent`
@@ -1479,8 +1519,14 @@ def _condition(source: Mapping[str, object]) -> tuple[str | None, bool]:
     whose other half could not hold (#290) — and there is no correct pick between them, only
     a refusal. A *false* `if_absent` is not a second condition, so it leaves an ordinary
     compare-and-set alone: refusing on the key's mere presence would break every client that
-    serialises the flag it holds rather than omitting it. Returned as the `(expect, expect_absent)` pair store.note_set takes
-    positionally, so no caller can apply one half of a condition and forget the other.
+    serialises the flag it holds rather than omitting it. Returned as the `(expect, expect_absent)`
+    pair store.note_set takes positionally, so no caller can apply one half of a condition and
+    forget the other.
+
+    The most common way a caller actually sends an empty one is an unset shell variable —
+    `?if=$LAST` with `LAST` unset is a condition nobody wrote. A sentinel would turn that
+    typo into create-if-missing on a world-writable note; today it is an unsatisfiable
+    condition, which refuses instead.
     """
     flag = source.get("if_absent", "")
     absent = flag if isinstance(flag, bool) else _ABSENT.get(_field(source, "if_absent").lower())
@@ -1723,20 +1769,25 @@ def humans(request: Request) -> Response:
 
     It is a *static* file: no message ever passes through the server into markup. The page
     fetches `?format=json` and renders every field with `textContent`, so hostile input is
-    text by construction rather than by escaping. A per-response nonce pins the inline
+    text by construction rather than by escaping. A `sha256-` CSP source pins the inline
     script and style, so even an injected tag could not execute.
+
+    The pin used to be a per-response nonce, which pinned the blocks just as tightly but
+    made every response unique — so the one 60 KiB document here could never be shared by
+    the edge, and had to come from the origin even when the origin was the thing that was
+    down. Hashing the blocks instead makes the response byte-identical between requests,
+    which is what lets `_static_cacheable` mean anything. The CDN also needs a rule marking
+    this path cache-eligible; without it the header is honoured by nobody.
     """
-    nonce = secrets.token_urlsafe(16)
-    return Response(
-        HUMANS.replace("__NONCE__", nonce),
+    resp = Response(
+        HUMANS,
         media_type="text/html; charset=utf-8",
         headers={
-            "Content-Security-Policy": (
-                f"default-src 'none'; connect-src 'self'; img-src 'self' data:; "
-                f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
-                f"base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-            ),
+            "Content-Security-Policy": HUMANS_CSP,
             "X-Content-Type-Options": "nosniff",
+            # Seeded, not omitted: _static_cacheable writes no header at all when the window
+            # is 0, and "0 disables" has to mean not cached rather than heuristically cached
+            # for however long a cache likes. Same shape as the other static responses.
             "Cache-Control": "no-store",
             "Referrer-Policy": "no-referrer",
             # The three service pointers the document lanes carry, in the header rather
@@ -1754,6 +1805,7 @@ def humans(request: Request) -> Response:
             "Link": manifest.link_header(_base_url(request)),
         },
     )
+    return _static_cacheable(resp)
 
 
 def robots(request: Request) -> Response:
@@ -1784,7 +1836,18 @@ def security_txt(request: Request) -> Response:
     return _static_cacheable(text(body, index=True))
 
 
-def healthz(request: Request) -> Response:
+async def healthz(request: Request) -> Response:
+    """`async` deliberately, though the body is a constant.
+
+    Starlette runs a plain `def` endpoint in the anyio threadpool, so every liveness check
+    took one of the 40 threads a worker has — and the moment that matters is the one where
+    there are none. Measured 2026-09-02: 2,478 of 2,480 /healthz requests in two minutes
+    arrived through the tunnel rather than from the container's own probes, 10.4% of all
+    traffic, while the write path had 40 of 42 threads parked in flock. A check that has to
+    queue for a thread to answer "ok" reports the queue, not the service, and the container
+    healthcheck was failing on exactly that. On the event loop it answers in microseconds
+    and needs no thread at all.
+    """
     return text("ok")
 
 

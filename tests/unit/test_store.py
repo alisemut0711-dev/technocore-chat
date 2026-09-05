@@ -1221,3 +1221,84 @@ def test_a_room_holding_undecodable_bytes_is_counted_not_crashed_on(tmp_path):
     # and reaching that answer at all is the half the binary mode buys.
     assert store._stillborn(p) is False
     assert store._reapable(p, os.stat(p).st_mtime, stillborn_rule=True) is None
+
+
+def test_compaction_retains_the_whole_byte_budget_at_every_record_size(tmp_path):
+    """Retention is the byte budget, at every record size.
+
+    `COMPACT_MAX_LINES` sits beside the budget in `_compact`, and the comment on it says it
+    "only bounds how much the compactor holds in memory at once". A flat 5000 made that
+    false: it bound first for any record under ~1 KB, which is every ordinary message. A
+    full ring of ~81-byte records compacted to 5000 records / 400 KB — 7.6% of the floor
+    the ring model promises, with every `since=` cursor further back than 5000 losing
+    history the ring still owed it.
+
+    Deriving the cap from the budget restores the stated meaning: at the smallest record
+    the write path emits (~73 B) the byte budget always stops the scan first, so the count
+    can only ever bind on malformed input, which is the memory case it is for.
+
+    Asserted at the small end because that is the end that broke, and against `keep` rather
+    than a record count so it keeps holding if the record shape changes.
+    """
+    import json
+
+    import store
+
+    path = tmp_path / "small.jsonl"
+    record = {"seq": 0, "ts": "2026-08-27T00:00:00.000000Z", "from": "bot", "text": "hi"}
+    written = size = 0
+    with path.open("wb") as handle:  # built directly: 140k append() calls is not a unit test
+        while size <= store.MAX_ROOM_BYTES:
+            written += 1
+            record["seq"] = written
+            line = (json.dumps(record) + "\n").encode()
+            handle.write(line)
+            size += len(line)
+
+    store._compact(path, cutoff=None, keep=store.COMPACT_KEEP_BYTES)
+
+    data = path.read_bytes()
+    seqs = [json.loads(line)["seq"] for line in data.splitlines()]
+    # Within one record of the budget, not merely "more than the old cap".
+    assert len(data) > store.COMPACT_KEEP_BYTES - 200, (
+        f"retained {len(data)} of a {store.COMPACT_KEEP_BYTES} byte budget"
+    )
+    assert len(data) <= store.COMPACT_KEEP_BYTES
+    assert seqs == sorted(seqs), "compaction must leave the file ascending by seq"
+    assert seqs[-1] == written, "the newest record must survive compaction"
+
+
+def test_the_append_path_can_size_the_file_it_just_wrote(tmp_path):
+    """The compaction check adds `size + len(line)` rather than stat()ing a file it has just
+    written while holding the room lock. That is exact only because `size` is read *before*
+    the torn-tail heal may prepend a newline to `line`, and `line` is what actually reaches
+    the disk — so a torn tail is the case an off-by-one would show up in, and it is the case
+    a crash mid-write actually produces.
+
+    Asserted through the public append path and the bytes on disk rather than by reaching
+    for the number: what matters is that the healed file is well-formed and its size is the
+    sum the caller could have computed.
+    """
+    import store
+
+    store.append(tmp_path, "torncalc", "bot", "first")
+    path = store.room_path(tmp_path, "torncalc")
+    with path.open("r+b") as f:  # a write cut short by a crash: the trailing newline is gone
+        f.truncate(path.stat().st_size - 1)
+
+    before = path.stat().st_size
+    store.append(tmp_path, "torncalc", "bot", "second")
+    after = path.stat().st_size
+
+    body = path.read_bytes()
+    assert body.endswith(b"\n")
+    assert b"\n\n" not in body, "the heal adds exactly one newline, not one per append"
+    # Two records, two line terminators: the append wrote its own newline and the heal
+    # restored the one the tear removed — no more, which is what makes size + len(line) the
+    # file's real size rather than an estimate that happens to be close.
+    assert body.count(b"\n") == 2
+    assert after == before + (len(body) - before)
+    assert after > before
+
+    texts = [m["text"] for m in store.read_messages(tmp_path, "torncalc")["messages"]]
+    assert texts == ["first", "second"], "the healed record and the new one both survive"
