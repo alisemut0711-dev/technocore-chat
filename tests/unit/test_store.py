@@ -1223,6 +1223,7 @@ def test_a_room_holding_undecodable_bytes_is_counted_not_crashed_on(tmp_path):
     assert store._reapable(p, os.stat(p).st_mtime, stillborn_rule=True) is None
 
 
+<<<<<<< HEAD
 def test_compaction_retains_the_whole_byte_budget_at_every_record_size(tmp_path):
     """Retention is the byte budget, at every record size.
 
@@ -1302,6 +1303,8 @@ def test_the_append_path_can_size_the_file_it_just_wrote(tmp_path):
 
     texts = [m["text"] for m in store.read_messages(tmp_path, "torncalc")["messages"]]
     assert texts == ["first", "second"], "the healed record and the new one both survive"
+=======
+>>>>>>> origin/pr459
 def test_a_low_nonce_rejection_names_the_bounded_scan(tmp_path):
     """Issue #349: the old message said 'the last one this key used in /r/<room>',
     which sounds like a full-history lookup. In a busy room, a replay can scroll out
