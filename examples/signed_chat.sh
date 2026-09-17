@@ -92,17 +92,17 @@ TEXT="hello from the signed lane"
 SIG=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "$TEXT" | tail -n1)
 echo "   sig (first 20 chars): ${SIG:0:20}..."
 
-RESP=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "$BASE/r/$ROOM/say-signed/$DID/$SIG/$NONCE/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$TEXT'))")?format=json")
+RESP=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "$BASE/r/$ROOM/say-signed/$DID/$SIG/$NONCE/$(uv run python -c "import urllib.parse; print(urllib.parse.quote('$TEXT'))")?format=json")
 HTTP_STATUS=$(echo "$RESP" | grep "HTTP_STATUS" | cut -d: -f2)
 BODY=$(echo "$RESP" | grep -v "HTTP_STATUS")
-echo "   HTTP $HTTP_STATUS  posted: $(python3 -c 'import json,sys; p=json.load(sys.stdin)["posted"]; print("seq",p["seq"],"nonce",p["nonce"])' <<<"$BODY")"
+echo "   HTTP $HTTP_STATUS  posted: $(uv run python -c 'import json,sys; p=json.load(sys.stdin)["posted"]; print("seq",p["seq"],"nonce",p["nonce"])' <<<"$BODY")"
 
 ok_has "HTTP_STATUS:200" "$RESP"
 # `?format=json` on the write, not the default text view: the text lane abbreviates a DID to
 # `z6Mk…XnDv` (didkey.abbreviate — a full one is ~1200 tokens on a 50-message fetch), so
 # grepping the rendered page for the DID we just signed with would never match. The JSON lane
 # carries it in full, which is also the lane a caller checking its own write wants.
-python3 -c '
+uv run python -c '
 import json, sys
 posted = json.load(sys.stdin)["posted"]
 assert posted["from"] == sys.argv[1], posted
@@ -115,13 +115,13 @@ NONCE=$((NONCE + 1))
 echo "   nonce state for this key in $ROOM: using nonce=$NONCE"
 TEXT="second message, same key"
 SIG2=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "$TEXT" | tail -n1)
-RESP2=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "$BASE/r/$ROOM/say-signed/$DID/$SIG2/$NONCE/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$TEXT'))")")
+RESP2=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "$BASE/r/$ROOM/say-signed/$DID/$SIG2/$NONCE/$(uv run python -c "import urllib.parse; print(urllib.parse.quote('$TEXT'))")")
 ok_has "HTTP_STATUS:200" "$RESP2"
 
 # ---------------------------------------------------------------- verify the records offline
 echo "== verifying the stored records offline, against the key alone"
 curl -sS "$BASE/r/$ROOM?format=json" >"$TMP/room.json"
-echo "   room has $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["messages"]))' "$TMP/room.json") messages"
+echo "   room has $(uv run python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["messages"]))' "$TMP/room.json") messages"
 
 # The server verified `room|nonce|swept-text` at write time and stored the signature beside
 # the record (src/store.py append). So the room JSON is self-contained: rebuild the same
@@ -188,7 +188,7 @@ echo "== nonce reuse must be refused"
 REUSE_TEXT="reused nonce, must be refused"
 SIG_REUSE=$(uv run python scripts/sign.py --seed "$DEMO_SEED" say "$ROOM" "$NONCE" "$REUSE_TEXT" | tail -n1)
 RESP_REUSE=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" \
-    "$BASE/r/$ROOM/say-signed/$DID/$SIG_REUSE/$NONCE/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$REUSE_TEXT'))")")
+    "$BASE/r/$ROOM/say-signed/$DID/$SIG_REUSE/$NONCE/$(uv run python -c "import urllib.parse; print(urllib.parse.quote('$REUSE_TEXT'))")")
 HTTP_REUSE=$(echo "$RESP_REUSE" | grep "HTTP_STATUS" | cut -d: -f2)
 REUSE_BODY=$(echo "$RESP_REUSE" | grep -v "HTTP_STATUS")
 echo "   HTTP $HTTP_REUSE  body: $REUSE_BODY"
